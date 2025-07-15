@@ -4,7 +4,7 @@ import logging
 import time
 from typing import Dict, List, cast
 from bluetti_mqtt.bluetooth import BadConnectionError, MultiDeviceManager, ModbusError, ParseError, build_device
-from bluetti_mqtt.bus import CommandMessage, EventBus, ParserMessage
+from bluetti_mqtt.bus import AvailabilityMessage, CommandMessage, EventBus, ParserMessage
 from bluetti_mqtt.core import BluettiDevice, ReadHoldingRegisters
 
 
@@ -14,6 +14,7 @@ class DeviceHandler:
         self.devices: Dict[str, BluettiDevice] = {}
         self.interval = interval
         self.bus = bus
+        self.device_availability: Dict[str, bool] = {}  # Track device connectivity
 
     async def run(self):
         loop = asyncio.get_running_loop()
@@ -35,8 +36,24 @@ class DeviceHandler:
             logging.debug(f'Performing command {msg.device}: {msg.command}')
             await self.manager.perform_nowait(msg.device.address, msg.command)
 
+    async def _check_device_availability(self, address: str):
+        """Check and update device availability status"""
+        is_ready = self.manager.is_ready(address)
+        current_status = self.device_availability.get(address, None)
+        
+        if current_status != is_ready:
+            self.device_availability[address] = is_ready
+            # Only send availability message if we have a device object
+            if address in self.devices:
+                device = self.devices[address]
+                logging.info(f'Device {device.type}-{device.sn} availability changed: {"online" if is_ready else "offline"}')
+                await self.bus.put(AvailabilityMessage(device, is_ready))
+
     async def _poll(self, address: str):
         while True:
+            # Check and update device availability
+            await self._check_device_availability(address)
+            
             if not self.manager.is_ready(address):
                 logging.debug(f'Waiting for connection to {address} to start polling...')
                 await asyncio.sleep(1)
@@ -56,6 +73,9 @@ class DeviceHandler:
 
     async def _pack_poll(self, address: str):
         while True:
+            # Check and update device availability
+            await self._check_device_availability(address)
+            
             if not self.manager.is_ready(address):
                 logging.debug(f'Waiting for connection to {address} to start pack polling...')
                 await asyncio.sleep(1)

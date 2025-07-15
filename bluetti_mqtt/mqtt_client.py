@@ -5,9 +5,9 @@ import json
 import logging
 import re
 from typing import List, Optional
-from aiomqtt import Client, MqttError
+from aiomqtt import Client, MqttError, Will
 from paho.mqtt.client import MQTTMessage
-from bluetti_mqtt.bus import CommandMessage, EventBus, ParserMessage
+from bluetti_mqtt.bus import AvailabilityMessage, CommandMessage, EventBus, ParserMessage
 from bluetti_mqtt.core import BluettiDevice, DeviceCommand
 
 
@@ -600,6 +600,7 @@ class MQTTClient:
         self.password = password
         self.home_assistant_mode = home_assistant_mode
         self.devices = []
+        self.device_availability = {}  # Track device connectivity status
 
     async def run(self):
         while True:
@@ -610,25 +611,74 @@ class MQTTClient:
                     hostname=self.hostname,
                     port=self.port,
                     username=self.username,
-                    password=self.password
+                    password=self.password,
+                    will=Will(
+                        topic='bluetti/bridge/status',
+                        payload='offline',
+                        qos=1,
+                        retain=True
+                    )
                 ) as client:
                     logging.info('Connected to MQTT broker')
+
+                    # Publish online status
+                    await self._publish_availability(client, True)
 
                     # Connect to event bus
                     self.message_queue = asyncio.Queue()
                     self.bus.add_parser_listener(self.handle_message)
+                    self.bus.add_availability_listener(self.handle_availability)
 
-                    # Handle pub/sub
-                    await asyncio.gather(
-                        self._handle_commands(client),
-                        self._handle_messages(client)
-                    )
+                    try:
+                        # Handle pub/sub
+                        await asyncio.gather(
+                            self._handle_commands(client),
+                            self._handle_messages(client)
+                        )
+                    finally:
+                        # Publish offline status before disconnecting
+                        await self._publish_availability(client, False)
             except MqttError:
                 logging.exception('MQTT error:')
                 await asyncio.sleep(5)
 
     async def handle_message(self, msg: ParserMessage):
         await self.message_queue.put(msg)
+
+    async def handle_availability(self, msg: AvailabilityMessage):
+        # We'll handle this in the _handle_messages loop with the current client
+        await self.message_queue.put(msg)
+
+    async def _publish_availability(self, client: Client, available: bool):
+        """Publish bridge availability status"""
+        topic = 'bluetti/bridge/status'
+        payload = 'online' if available else 'offline'
+        
+        try:
+            await client.publish(topic, payload.encode(), qos=1, retain=True)
+            logging.info(f'Published bridge availability: {payload}')
+        except Exception as e:
+            logging.error(f'Failed to publish bridge availability: {e}')
+
+    async def _publish_device_availability(self, client: Client, device: BluettiDevice, available: bool):
+        """Publish device-specific availability status"""
+        topic = f'bluetti/status/{device.type}-{device.sn}/availability'
+        payload = 'online' if available else 'offline'
+        
+        try:
+            await client.publish(topic, payload.encode(), qos=1, retain=True)
+            current_status = self.device_availability.get(device.sn, None)
+            if current_status != available:
+                logging.info(f'Published device {device.type}-{device.sn} availability: {payload}')
+                self.device_availability[device.sn] = available
+        except Exception as e:
+            logging.error(f'Failed to publish device {device.type}-{device.sn} availability: {e}')
+
+    async def _set_device_availability(self, client: Client, device: BluettiDevice, available: bool):
+        """Set device availability and publish if changed"""
+        current_status = self.device_availability.get(device.sn, None)
+        if current_status != available:
+            await self._publish_device_availability(client, device, available)
 
     async def _handle_commands(self, client: Client):
         await client.subscribe('bluetti/command/#')
@@ -637,15 +687,21 @@ class MQTTClient:
 
     async def _handle_messages(self, client: Client):
         while True:
-            msg: ParserMessage = await self.message_queue.get()
-            if msg.device not in self.devices:
-                await self._init_device(msg.device, client)
-            await self._handle_message(client, msg)
+            msg = await self.message_queue.get()
+            if isinstance(msg, ParserMessage):
+                if msg.device not in self.devices:
+                    await self._init_device(msg.device, client)
+                await self._handle_message(client, msg)
+            elif isinstance(msg, AvailabilityMessage):
+                await self._set_device_availability(client, msg.device, msg.available)
             self.message_queue.task_done()
 
     async def _init_device(self, device: BluettiDevice, client: Client):
         # Register device
         self.devices.append(device)
+        
+        # Set device as online when first discovered
+        await self._set_device_availability(client, device, True)
 
         # Skip announcing device to Home Assistant if disabled
         if self.home_assistant_mode == 'none':
@@ -668,6 +724,20 @@ class MQTTClient:
             }
             if field.setter:
                 payload_dict['command_topic'] = f'bluetti/command/{device.type}-{device.sn}/{id}'
+            # Use both bridge and device availability topics
+            payload_dict['availability'] = [
+                {
+                    'topic': 'bluetti/bridge/status',
+                    'payload_available': 'online',
+                    'payload_not_available': 'offline'
+                },
+                {
+                    'topic': f'bluetti/status/{device.type}-{device.sn}/availability',
+                    'payload_available': 'online',
+                    'payload_not_available': 'offline'
+                }
+            ]
+            payload_dict['availability_mode'] = 'all'
             payload_dict.update(field.home_assistant_extra)
 
             return json.dumps(payload_dict, separators=(',', ':'))
