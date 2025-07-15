@@ -623,6 +623,13 @@ class MQTTClient:
 
                     # Publish online status
                     await self._publish_availability(client, True)
+                    
+                    # Republish all device availability on reconnect
+                    for sn, available in self.device_availability.items():
+                        device = next((d for d in self.devices if d.sn == sn), None)
+                        if device:
+                            await self._publish_device_availability(client, device, available)
+                            logging.info(f'Republished device {device.type}-{device.sn} availability on reconnect: {"online" if available else "offline"}')
 
                     # Connect to event bus
                     self.message_queue = asyncio.Queue()
@@ -633,7 +640,8 @@ class MQTTClient:
                         # Handle pub/sub
                         await asyncio.gather(
                             self._handle_commands(client),
-                            self._handle_messages(client)
+                            self._handle_messages(client),
+                            self._periodic_availability_refresh(client)
                         )
                     finally:
                         # Publish offline status before disconnecting
@@ -679,6 +687,23 @@ class MQTTClient:
         current_status = self.device_availability.get(device.sn, None)
         if current_status != available:
             await self._publish_device_availability(client, device, available)
+
+    async def _periodic_availability_refresh(self, client: Client):
+        """Periodically republish availability to ensure it stays current"""
+        refresh_interval = 60  # Refresh every minute
+        while True:
+            try:
+                await asyncio.sleep(refresh_interval)
+                # Republish bridge availability
+                await self._publish_availability(client, True)
+                # Republish all device availability
+                for sn, available in self.device_availability.items():
+                    device = next((d for d in self.devices if d.sn == sn), None)
+                    if device:
+                        await self._publish_device_availability(client, device, available)
+                logging.debug('Refreshed all availability topics')
+            except Exception as e:
+                logging.error(f'Error in periodic availability refresh: {e}')
 
     async def _handle_commands(self, client: Client):
         await client.subscribe('bluetti/command/#')
